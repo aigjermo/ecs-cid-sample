@@ -30,7 +30,7 @@ lambdaClient = session.client('lambda')
 """
 def publishToSNS(message, topicARN):
     logger.info("Publish to SNS topic %s",topicARN)
-    snsResponse = snsClient.publish(
+    snsClient.publish(
         TopicArn=topicARN,
         Message=json.dumps(message),
         Subject='Publishing SNS message to invoke lambda again..'
@@ -63,7 +63,7 @@ def checkContainerInstanceTaskStatus(Ec2InstanceId):
     paginator = ecsClient.get_paginator('list_container_instances')
     clusterListPages = paginator.paginate(cluster=clusterName)
     for containerListResp in clusterListPages:
-        containerDetResp = ecsClient.describe_container_instances(cluster=clusterName, containerInstances=clusterListResp[
+        containerDetResp = ecsClient.describe_container_instances(cluster=clusterName, containerInstances=containerListResp[
             'containerInstanceArns'])
         logger.debug("describe container instances response %s",containerDetResp)
 
@@ -83,7 +83,7 @@ def checkContainerInstanceTaskStatus(Ec2InstanceId):
                 else:
                     # Make ECS API call to set the container status to DRAINING
                     logger.info("Make ECS API call to set the container status to DRAINING...")
-                    ecsResponse = ecsClient.update_container_instances_state(cluster=clusterName,containerInstances=[containerInstanceId],status='DRAINING')
+                    ecsClient.update_container_instances_state(cluster=clusterName,containerInstances=[containerInstanceId],status='DRAINING')
                     # When you set instance state to draining, append the containerInstanceID to the message as well
                     tmpMsgAppend = {"containerInstanceId": containerInstanceId}
                 break
@@ -120,7 +120,6 @@ def lambda_handler(event, context):
     lifecyclehookname = None
     clusterName = None
     tmpMsgAppend = None
-    completeHook = 0
 
     logger.info("Lambda received the event %s",event)
     logger.debug("records: %s",event['Records'][0])
@@ -163,17 +162,10 @@ def lambda_handler(event, context):
 
             # If tasks are still running...
             if tasksRunning == 1:
-                response = snsClient.list_subscriptions()
-                for key in response['Subscriptions']:
-                    logger.info("Endpoint %s AND TopicArn %s and protocol %s ",key['Endpoint'], key['TopicArn'],
-                                                                                  key['Protocol'])
-                    if TopicArn == key['TopicArn'] and key['Protocol'] == 'lambda':
-                        logger.info("TopicArn match, publishToSNS function...")
-                        msgResponse = publishToSNS(message, key['TopicArn'])
-                        logger.debug("msgResponse %s and time is %s",msgResponse, datetime.datetime)
+                msgResponse = publishToSNS(message, TopicArn)
+                logger.debug("msgResponse %s and time is %s",msgResponse, datetime.datetime)
             # If tasks are NOT running...
             elif tasksRunning == 0:
-                completeHook = 1
                 logger.debug("Setting lifecycle to complete;No tasks are running on instance, completing lifecycle action....")
 
                 try:
