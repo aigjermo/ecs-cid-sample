@@ -141,10 +141,6 @@ def lambda_handler(event, context):
             clusterName = token.split('=')[1]
             logger.debug("Cluster name %s",clusterName)
 
-    # Get list of container instance IDs from the clusterName
-    clusterListResp = ecsClient.list_container_instances(cluster=clusterName)
-    logger.debug("list container instances response %s",clusterListResp)
-
     # If the event received is instance terminating...
     if 'LifecycleTransition' in message.keys():
         logger.debug("message autoscaling %s",message['LifecycleTransition'])
