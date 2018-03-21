@@ -62,6 +62,7 @@ def checkContainerInstanceTaskStatus(Ec2InstanceId, clusterListResp):
     # Get list of container instance IDs from the clusterName
     paginator = ecsClient.get_paginator('list_container_instances')
     clusterListPages = paginator.paginate(cluster=clusterName)
+    containerListResp = None
     for containerListResp in clusterListPages:
         containerDetResp = ecsClient.describe_container_instances(cluster=clusterName, containerInstances=containerListResp[
             'containerInstanceArns'])
@@ -118,7 +119,7 @@ def lambda_handler(event, context):
     snsArn = event['Records'][0]['EventSubscriptionArn']
     TopicArn = event['Records'][0]['Sns']['TopicArn']
 
-    lifecyclehookname = None
+    lifecycleHookName = None
     clusterName = None
     tmpMsgAppend = None
 
