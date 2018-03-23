@@ -4,6 +4,7 @@ groups used with ECS.
 """
 
 from __future__ import print_function
+from os import environ
 import base64
 import json
 import datetime
@@ -14,7 +15,12 @@ import boto3
 
 logging.basicConfig()
 LOGGER = logging.getLogger()
-LOGGER.setLevel(logging.DEBUG)
+
+if 'LOGDEBUG' in environ:
+    LOGGER.setLevel(logging.DEBUG)
+else:
+    LOGGER.setLevel(logging.INFO)
+
 
 # Establish boto3 session
 SESSION = boto3.session.Session()
@@ -27,11 +33,87 @@ SNSCLIENT = SESSION.client('sns')
 LAMBDACLIENT = SESSION.client('lambda')
 
 
+def getClusterName(ec2InstanceId):
+    """
+    Tries to get cluster name from the environment variable `ECS_CLUSTER`, and
+    falls back to parsing the user data script of the container instance,
+    returning the value of the `ECS_CLUSTER` field.
+    """
+    if 'ECS_CLUSTER' in environ:
+        LOGGER.debug("Cluster name from env: %s", environ['ECS_CLUSTER'])
+        return environ['ECS_CLUSTER']
+
+    ec2Resp = EC2CLIENT.describe_instance_attribute(
+        InstanceId=ec2InstanceId, Attribute='userData')
+    LOGGER.debug("Describe instance attributes response %s", ec2Resp)
+    userdata = base64.b64decode(ec2Resp['UserData']['Value'])
+
+    for line in userdata.split():
+        if line.find("ECS_CLUSTER") > -1:
+            clusterName = line.split('=')[1]
+            LOGGER.debug("Cluster name %s", clusterName)
+            return clusterName
+
+    LOGGER.debug("Cluster name not found in env or user data.")
+    return None
+
+
+def getContainerInstanceData(ec2InstanceId, clusterName):
+    """
+    Finds the container instance id from ECS that matches the instance id from
+    EC2.
+    """
+
+    # Get list of container instance IDs from the clusterName
+    paginator = ECSCLIENT.get_paginator('list_container_instances')
+
+    for containerList in paginator.paginate(cluster=clusterName):
+
+        containerDetResp = ECSCLIENT.describe_container_instances(
+            cluster=clusterName,
+            containerInstances=containerList['containerInstanceArns'])
+        LOGGER.debug("describe container instances response %s",
+                     containerDetResp)
+
+        for instance in containerDetResp['containerInstances']:
+            if instance['ec2InstanceId'] == ec2InstanceId:
+                LOGGER.info("Container instance ID of interest : %s",
+                            instance['containerInstanceArn'])
+                return instance
+
+    LOGGER.debug("Could not get ecs container instance data")
+    return None
+
+
+def getTerminatingLifeCycleHookName(message):
+    """
+    Retrieves the name of the termination life cycle hook that triggered this
+    action
+    """
+
+    # If the event received is instance terminating...
+    if 'LifecycleTransition' not in message.keys():
+        LOGGER.debug("LifecycleTransition not in message")
+        return None
+
+    LOGGER.debug("message autoscaling %s", message['LifecycleTransition'])
+    if message['LifecycleTransition'].find(
+            'autoscaling:EC2_INSTANCE_TERMINATING') > -1:
+
+        # Get lifecycle hook name
+        lifecycleHookName = message['LifecycleHookName']
+        LOGGER.debug("Setting lifecycle hook name %s ", lifecycleHookName)
+        return lifecycleHookName
+
+    return None
+
+
 def publishToSNS(message, topicARN):
     """
-    Publish SNS message to trigger lambda again.  :param message: To repost the
-    complete original message received when ASG terminating event was received.
-    :param topicARN: SNS topic to publish the message to.
+    Publish SNS message to trigger lambda again.
+        :param message:     To repost the complete original message received
+                            when ASG terminating event was received.
+        :param topicARN:    SNS topic to publish the message to.
     """
     LOGGER.info("Publish to SNS topic %s", topicARN)
     SNSCLIENT.publish(
@@ -42,169 +124,80 @@ def publishToSNS(message, topicARN):
     return "published"
 
 
-def checkContainerInstanceTaskStatus(ec2InstanceId):
+def instanceDrainingHandler(ec2InstanceId):
     """
-    Check task status on the ECS container instance ID.
+    Check task status on the ECS container instance and manage draining.
         :param ec2InstanceId:   The EC2 instance ID is used to identify the
-                                cluster, container instances in cluster
+                                cluster and container instance to manage
+
+        :returns                True if lifecycle should complete
     """
-    containerInstanceId = None
-    clusterName = None
-    tmpMsgAppend = None
+    clusterName = getClusterName(ec2InstanceId)
+    instance = getContainerInstanceData(ec2InstanceId, clusterName)
 
-    # Describe instance attributes and get the Clustername from userdata
-    # section which would have set ECS_CLUSTER name
-    ec2Resp = EC2CLIENT.describe_instance_attribute(
-        InstanceId=ec2InstanceId, Attribute='userData')
-    userdataEncoded = ec2Resp['UserData']
-    userdataDecoded = base64.b64decode(userdataEncoded['Value'])
-    LOGGER.debug("Describe instance attributes response %s", ec2Resp)
+    if instance is None:
+        LOGGER.debug("Instance not found in ecs, probably not registered")
+        return True
 
-    tmpList = userdataDecoded.split()
-    for token in tmpList:
-        if token.find("ECS_CLUSTER") > -1:
-            # Split and get the cluster name
-            clusterName = token.split('=')[1]
-            LOGGER.info("Cluster name %s", clusterName)
+    instanceId = instance['containerInstanceArn']
+    taskCount = instance['runningTasksCount']
 
-    # Get list of container instance IDs from the clusterName
-    paginator = ECSCLIENT.get_paginator('list_container_instances')
-    clusterListPages = paginator.paginate(cluster=clusterName)
-    containerListResp = None
-    for containerListResp in clusterListPages:
-        containerDetResp = ECSCLIENT.describe_container_instances(
+    if instance['status'] != 'DRAINING':
+        LOGGER.info("Draining instance: %s", instanceId)
+        ECSCLIENT.update_container_instances_state(
             cluster=clusterName,
-            containerInstances=containerListResp['containerInstanceArns'])
-        LOGGER.debug("describe container instances response %s",
-                     containerDetResp)
+            containerInstances=[instanceId],
+            status='DRAINING')
+    else:
+        LOGGER.debug("Instance is already draining")
 
-        for containerInstances in containerDetResp['containerInstances']:
-            LOGGER.debug(
-                "Container Instance ARN: %s and ec2 Instance ID %s",
-                containerInstances['containerInstanceArn'],
-                containerInstances['Ec2InstanceId'])
-            if containerInstances['Ec2InstanceId'] == ec2InstanceId:
-                LOGGER.info("Container instance ID of interest : %s",
-                            containerInstances['containerInstanceArn'])
-                containerInstanceId = containerInstances['containerInstanceArn']
-
-                # Check if the instance state is set to DRAINING. If not, set
-                # it, so the ECS Cluster will handle de-registering instance,
-                # draining tasks and draining them
-                containerStatus = containerInstances['status']
-                if containerStatus == 'DRAINING':
-                    LOGGER.info(
-                        "Container ID %s with EC2 instance-id %s is draining tasks",
-                        containerInstanceId, ec2InstanceId)
-                    tmpMsgAppend = {"containerInstanceId": containerInstanceId}
-                else:
-                    # Make ECS API call to set the container status to DRAINING
-                    LOGGER.info(
-                        "Make ECS API call to set the container status to DRAINING...")
-                    ECSCLIENT.update_container_instances_state(
-                        cluster=clusterName,
-                        containerInstances=[containerInstanceId],
-                        status='DRAINING')
-                    # When you set instance state to draining, append the
-                    # containerInstanceID to the message as well
-                    tmpMsgAppend = {"containerInstanceId": containerInstanceId}
-                break
-            if containerInstanceId is not None:
-                break
-
-    # Using container Instance ID, get the task list, and task running on that
-    # instance.
-    if containerInstanceId is not None:
-        # List tasks on the container instance ID, to get task Arns
-        listTaskResp = ECSCLIENT.list_tasks(
-            cluster=clusterName, containerInstance=containerInstanceId)
-        LOGGER.debug("Container instance task list %s",
-                     listTaskResp['taskArns'])
-
-        # If the chosen instance has tasks
-        if not listTaskResp['taskArns']:
-            LOGGER.info("Tasks are on this instance...%s", ec2InstanceId)
-            return 1, tmpMsgAppend
-        LOGGER.info("NO tasks are on this instance...%s", ec2InstanceId)
-        return 0, tmpMsgAppend
-
-    LOGGER.info("NO tasks are on this instance....%s", ec2InstanceId)
-    return 0, tmpMsgAppend
+    LOGGER.info("Remaining task count on %s: %d", instanceId, taskCount)
+    return taskCount == 0
 
 
 def lambdaHandler(event, _):
     """Lambda handler function"""
     LOGGER.info("Lambda received the event %s", event)
 
-    line = event['Records'][0]['Sns']['Message']
-    message = json.loads(line)
+    message = json.loads(event['Records'][0]['Sns']['Message'])
     ec2InstanceId = message['EC2InstanceId']
     asgGroupName = message['AutoScalingGroupName']
     snsArn = event['Records'][0]['EventSubscriptionArn']
     topicArn = event['Records'][0]['Sns']['TopicArn']
 
-    lifecycleHookName = None
-    clusterName = None
-    tmpMsgAppend = None
-
     LOGGER.debug("records: %s", event['Records'][0])
     LOGGER.debug("sns: %s", event['Records'][0]['Sns'])
     LOGGER.debug("Message: %s", message)
-    LOGGER.debug("Ec2 Instance Id %s ,%s", ec2InstanceId, asgGroupName)
-    LOGGER.debug("SNS ARN %s", snsArn)
+    LOGGER.debug("Ec2 Instance Id: %s ,%s", ec2InstanceId, asgGroupName)
+    LOGGER.debug("SNS ARN: %s", snsArn)
+    LOGGER.debug("Topic ARN: %s", event['Records'][0]['Sns']['TopicArn'])
 
-    # Describe instance attributes and get the Clustername from userdata
-    # section which would have set ECS_CLUSTER name
-    ec2Resp = EC2CLIENT.describe_instance_attribute(
-        InstanceId=ec2InstanceId, Attribute='userData')
-    LOGGER.debug("Describe instance attributes response %s", ec2Resp)
-    userdataEncoded = ec2Resp['UserData']
-    userdataDecoded = base64.b64decode(userdataEncoded['Value'])
-
-    tmpList = userdataDecoded.split()
-    for token in tmpList:
-        if token.find("ECS_CLUSTER") > -1:
-            # Split and get the cluster name
-            clusterName = token.split('=')[1]
-            LOGGER.debug("Cluster name %s", clusterName)
+    lifecycleHookName = getTerminatingLifeCycleHookName(message)
 
     # If the event received is instance terminating...
-    if 'LifecycleTransition' in message.keys():
-        LOGGER.debug("message autoscaling %s", message['LifecycleTransition'])
-        if message['LifecycleTransition'].find(
-                'autoscaling:EC2_INSTANCE_TERMINATING') > -1:
+    if lifecycleHookName is not None:
+        # Check if there are any tasks running on the instance
+        finished = instanceDrainingHandler(ec2InstanceId)
 
-            # Get lifecycle hook name
-            lifecycleHookName = message['LifecycleHookName']
-            LOGGER.debug("Setting lifecycle hook name %s ", lifecycleHookName)
+        if not finished:
+            msgResponse = publishToSNS(message, topicArn)
+            LOGGER.debug("msgResponse %s and time is %s",
+                         msgResponse, datetime.datetime)
 
-            # Check if there are any tasks running on the instance
-            tasksRunning, tmpMsgAppend = checkContainerInstanceTaskStatus(
-                ec2InstanceId)
-            LOGGER.debug("Returned values received: %s ", tasksRunning)
-            if tmpMsgAppend is not None:
-                message.update(tmpMsgAppend)
+        else:
+            LOGGER.debug(
+                "Setting lifecycle to complete;No tasks are running on "
+                "instance, completing lifecycle action....")
 
-            # If tasks are still running...
-            if tasksRunning == 1:
-                msgResponse = publishToSNS(message, topicArn)
-                LOGGER.debug("msgResponse %s and time is %s",
-                             msgResponse, datetime.datetime)
-            # If tasks are NOT running...
-            elif tasksRunning == 0:
+            try:
+                response = ASGCLIENT.complete_lifecycle_action(
+                    LifecycleHookName=lifecycleHookName,
+                    AutoScalingGroupName=asgGroupName,
+                    LifecycleActionResult='CONTINUE',
+                    InstanceId=ec2InstanceId)
                 LOGGER.debug(
-                    "Setting lifecycle to complete;No tasks are running on "
-                    "instance, completing lifecycle action....")
-
-                try:
-                    response = ASGCLIENT.complete_lifecycle_action(
-                        LifecycleHookName=lifecycleHookName,
-                        AutoScalingGroupName=asgGroupName,
-                        LifecycleActionResult='CONTINUE',
-                        InstanceId=ec2InstanceId)
-                    LOGGER.info(
-                        "Response received from complete_lifecycle_action %s",
-                        response)
-                    LOGGER.info("Completedlifecycle hook action")
-                except Exception as err:
-                    print(str(err))
+                    "Response received from complete_lifecycle_action %s",
+                    response)
+                LOGGER.info("Completedlifecycle hook action")
+            except Exception as err:
+                print(str(err))
